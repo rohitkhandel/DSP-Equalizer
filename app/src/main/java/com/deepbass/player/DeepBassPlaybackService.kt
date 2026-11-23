@@ -13,7 +13,7 @@ import androidx.media3.session.MediaSessionService
  * Owns the player and DSP chain independently of the Activity, allowing
  * Media3 to keep playback running and publish system media controls.
  */
-@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@OptIn(androidx.media3.common.util.UnstableApi::class)
 class DeepBassPlaybackService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
