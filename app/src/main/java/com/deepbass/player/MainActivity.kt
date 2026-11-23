@@ -30,6 +30,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -44,6 +45,9 @@ fun DeepBassScreen() {
     val eqFrequencies = listOf("31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz")
 
     var selectedSong by remember { mutableStateOf("No track selected") }
+    var selectedAudioUri by remember { mutableStateOf<Uri?>(null) }
+    var exportStatus by remember { mutableStateOf("") }
+    val coroutineScope = rememberCoroutineScope()
     var isPlaying by remember { mutableStateOf(false) }
     var connectionReady by remember { mutableStateOf(false) }
     var bass by remember { mutableFloatStateOf(34f) }
@@ -117,12 +121,43 @@ fun DeepBassScreen() {
                     Intent.FLAG_GRANT_READ_URI_PERMISSION
                 )
             } catch (_: SecurityException) { }
+            selectedAudioUri = selectedUri
+            exportStatus = ""
             selectedSong = selectedUri.lastPathSegment?.substringAfterLast('/')
                 ?: "Selected audio file"
             mediaController?.let { controller ->
                 controller.setMediaItem(MediaItem.fromUri(selectedUri))
                 controller.prepare()
                 controller.play()
+            }
+        }
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("audio/wav")
+    ) { outputUri: Uri? ->
+        val inputUri = selectedAudioUri
+        if (outputUri != null && inputUri != null) {
+            val settings = DspExportSettings(
+                bass = bass,
+                punch = punch,
+                vocal = vocal,
+                preampDb = preamp,
+                equalizerGainsDb = eqGains.toFloatArray()
+            )
+            exportStatus = "Processing audio locally…"
+            coroutineScope.launch {
+                try {
+                    val writtenBytes = OfflineWavExporter.export(
+                        context = context,
+                        inputUri = inputUri,
+                        outputUri = outputUri,
+                        settings = settings
+                    )
+                    exportStatus = "WAV saved • ${(writtenBytes / 1024L).coerceAtLeast(1L)} KB"
+                } catch (error: Exception) {
+                    exportStatus = "Export failed: ${error.message ?: "Unsupported audio file"}"
+                }
             }
         }
     }
@@ -179,6 +214,24 @@ fun DeepBassScreen() {
                             }
                         }
                     }
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        val baseName = selectedSong
+                            .substringAfterLast('/')
+                            .substringBeforeLast('.', selectedSong)
+                            .take(60)
+                            .ifBlank { "DeepBass" }
+                        exportLauncher.launch("${baseName}_DeepBass.wav")
+                    },
+                    enabled = selectedAudioUri != null && connectionReady,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Export processed WAV")
+                }
+                if (exportStatus.isNotEmpty()) {
+                    Text(exportStatus, color = Color(0xFFB7F36B), fontSize = 11.sp)
                 }
 
                 Text("BASS & TONE", color = Color.White, fontSize = 16.sp)
