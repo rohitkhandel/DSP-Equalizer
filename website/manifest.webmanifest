@@ -1,0 +1,12 @@
+{
+  "name": "DeepBass Web Studio",
+  "short_name": "DeepBass",
+  "description": "Private browser-based audio player and bass processor.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#090b0f",
+  "theme_color": "#090b0f",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
