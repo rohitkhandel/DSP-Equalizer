@@ -9,7 +9,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.GraphicEq
@@ -50,7 +52,6 @@ fun DeepBassScreen() {
                 enableFloatOutput: Boolean,
                 enableAudioOutputPlaybackParams: Boolean
             ): AudioSink? {
-                // Float output is kept disabled so PCM processing remains active.
                 return DefaultAudioSink.Builder(context)
                     .setAudioProcessors(arrayOf<AudioProcessor>(processor))
                     .setEnableFloatOutput(false)
@@ -62,16 +63,23 @@ fun DeepBassScreen() {
         ExoPlayer.Builder(context, renderersFactory).build()
     }
 
+    val eqFrequencies = listOf("31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz")
     var selectedSong by remember { mutableStateOf("No track selected") }
     var isPlaying by remember { mutableStateOf(false) }
     var bass by remember { mutableFloatStateOf(38f) }
     var punch by remember { mutableFloatStateOf(30f) }
     var vocal by remember { mutableFloatStateOf(24f) }
+    var preamp by remember { mutableFloatStateOf(-4f) }
+    var eqGains by remember {
+        mutableStateOf(listOf(2f, 3f, 2f, 0.5f, -0.5f, 0f, 0.5f, 1f, 1f, 0.5f))
+    }
 
-    SideEffect {
+    LaunchedEffect(bass, punch, vocal, preamp, eqGains) {
         processor.bassAmount = bass / 100f
         processor.punchAmount = punch / 100f
         processor.vocalAmount = vocal / 100f
+        processor.preampDb = preamp
+        processor.setEqualizerGains(eqGains.toFloatArray())
     }
 
     DisposableEffect(player) {
@@ -106,15 +114,15 @@ fun DeepBassScreen() {
     )) {
         Surface(Modifier.fillMaxSize(), color = Color(0xFF090B0F)) {
             Column(
-                Modifier.fillMaxSize().padding(22.dp),
-                verticalArrangement = Arrangement.spacedBy(17.dp)
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(15.dp)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Default.GraphicEq, null, tint = Color(0xFFB7F36B))
                     Spacer(Modifier.width(10.dp))
                     Text("DEEPBASS", color = Color.White, fontSize = 22.sp)
                     Spacer(Modifier.weight(1f))
-                    Text("DSP BETA 0.4", color = Color.Gray, fontSize = 12.sp)
+                    Text("DSP BETA 0.5", color = Color.Gray, fontSize = 12.sp)
                 }
                 Text("Subwoofer-style depth.", color = Color.White, fontSize = 27.sp)
                 Text("Deep low-end • Tight punch • Clear vocals", color = Color.LightGray)
@@ -149,11 +157,43 @@ fun DeepBassScreen() {
                         }
                     }
                 }
+
                 Text("BASS & TONE", color = Color.White, fontSize = 16.sp)
                 ControlSlider("Sub-bass depth", bass, { bass = it }, "Low-frequency weight and rumble")
-                ControlSlider("Punch", punch, { punch = it }, "Tighter kick and mid-bass impact")
+                ControlSlider("Punch", punch, { punch = it }, "Tight kick and upper-bass impact")
                 ControlSlider("Vocal clarity", vocal, { vocal = it }, "Gentle vocal-presence lift")
-                Spacer(Modifier.weight(1f))
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Preamp / Headroom", color = Color.White)
+                        Spacer(Modifier.weight(1f))
+                        Text("\${preamp.toInt()} dB", color = Color(0xFFB7F36B))
+                    }
+                    Slider(value = preamp, onValueChange = { preamp = it }, valueRange = -12f..0f, steps = 23)
+                    Text("Lower values make extra space for bass and EQ boosts", color = Color.Gray, fontSize = 10.sp)
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("10-BAND EQUALIZER", color = Color.White, fontSize = 16.sp)
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { eqGains = List(10) { 0f } }) { Text("Reset") }
+                }
+                for (index in 0 until 10 step 2) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        EqBandControl(
+                            eqFrequencies[index],
+                            eqGains[index],
+                            { value -> eqGains = eqGains.toMutableList().also { it[index] = value } },
+                            Modifier.weight(1f)
+                        )
+                        EqBandControl(
+                            eqFrequencies[index + 1],
+                            eqGains[index + 1],
+                            { value -> eqGains = eqGains.toMutableList().also { it[index + 1] = value } },
+                            Modifier.weight(1f)
+                        )
+                    }
+                }
+
                 Surface(color = Color(0xFF203020), shape = RoundedCornerShape(50)) {
                     Text(
                         "Custom PCM DSP active • Local processing",
@@ -179,9 +219,36 @@ private fun ControlSlider(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, color = Color.White)
             Spacer(Modifier.weight(1f))
-            Text("${value.toInt()}%", color = Color(0xFFB7F36B))
+            Text("\${value.toInt()}%", color = Color(0xFFB7F36B))
         }
         Slider(value = value, onValueChange = onValueChange, valueRange = 0f..100f)
         Text(helper, color = Color.Gray, fontSize = 10.sp)
+    }
+}
+
+@Composable
+private fun EqBandControl(
+    frequency: String,
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(1.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(frequency, color = Color.LightGray, fontSize = 11.sp)
+            Spacer(Modifier.weight(1f))
+            val displayed = (value * 2f).toInt() / 2f
+            Text(
+                if (displayed > 0f) "+$displayed dB" else "$displayed dB",
+                color = Color(0xFFB7F36B),
+                fontSize = 11.sp
+            )
+        }
+        Slider(
+            value = value,
+            onValueChange = onValueChange,
+            valueRange = -12f..12f,
+            steps = 47
+        )
     }
 }
