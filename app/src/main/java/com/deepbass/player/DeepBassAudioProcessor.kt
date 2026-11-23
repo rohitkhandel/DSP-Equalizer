@@ -58,9 +58,14 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
     // Circular look-ahead audio buffer. Each frame stores all channels together.
     private var limiterBuffer = Array(2) { FloatArray(channels) }
     private var limiterWriteIndex = 0
-    private var limiterFilledFrames = 0
     private var limiterGain = 1.0f
     private var limiterReleaseCoefficient = 0.0f
+    private var limiterLookAheadFrames = 1
+    private var limiterFramesProcessed = 0L
+    private var peakDequeIndices = LongArray(4)
+    private var peakDequeValues = FloatArray(4)
+    private var peakDequeHead = 0
+    private var peakDequeCount = 0
     private val limiterThreshold = 0.90f
 
     init {
@@ -114,7 +119,9 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         val coefficients = equalizerCoefficients
 
         repeat(frames) {
-            // Decode and shape each channel, then add this frame to the look-ahead buffer.
+            var framePeak = 0f
+
+            // Decode and shape the frame, then store it in the look-ahead audio ring.
             repeat(channels) { channel ->
                 val decoded = if (encoding == C.ENCODING_PCM_FLOAT) {
                     input.float
@@ -124,7 +131,7 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
 
                 var shaped = decoded * preampGain
 
-                // Ten peaking filters. Coefficients are recalculated only when controls change.
+                // Ten peaking filters; their coefficients are prepared outside this audio loop.
                 for (band in coefficients.indices) {
                     val c = coefficients[band]
                     val z1 = eqZ1[band]
@@ -146,48 +153,57 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
                     (sub * bassGain) +
                     (punchBand * punchGain) +
                     (vocalBand * vocalGain)
-
-                limiterBuffer[limiterWriteIndex][channel] =
-                    if (mixed.isFinite()) mixed else 0f
+                val safeSample = if (mixed.isFinite()) mixed else 0f
+                limiterBuffer[limiterWriteIndex][channel] = safeSample
+                framePeak = maxOf(framePeak, abs(safeSample))
             }
 
-            // Advance the circular write pointer. Once full, it points at the oldest frame.
+            // Maintain a monotonic maximum queue. This replaces scanning every
+            // sample in the 3 ms look-ahead window (which was too expensive on mobile).
+            val currentFrameIndex = limiterFramesProcessed
+            while (peakDequeCount > 0) {
+                val tailPosition = (peakDequeHead + peakDequeCount - 1) % peakDequeIndices.size
+                if (peakDequeValues[tailPosition] > framePeak) break
+                peakDequeCount--
+            }
+            val newTail = (peakDequeHead + peakDequeCount) % peakDequeIndices.size
+            peakDequeIndices[newTail] = currentFrameIndex
+            peakDequeValues[newTail] = framePeak
+            peakDequeCount++
+
+            val oldestFrameIndex = currentFrameIndex - limiterLookAheadFrames
+            while (peakDequeCount > 0 && peakDequeIndices[peakDequeHead] < oldestFrameIndex) {
+                peakDequeHead = (peakDequeHead + 1) % peakDequeIndices.size
+                peakDequeCount--
+            }
+
+            // After the pointer advances, it points to the oldest delayed audio frame.
             limiterWriteIndex = (limiterWriteIndex + 1) % limiterBuffer.size
-            if (limiterFilledFrames < limiterBuffer.size) {
-                limiterFilledFrames++
-            }
 
-            if (limiterFilledFrames < limiterBuffer.size) {
-                // Prime the look-ahead buffer with silence; audio starts after ~3 ms.
+            if (currentFrameIndex < limiterLookAheadFrames) {
                 repeat(channels) {
                     if (encoding == C.ENCODING_PCM_FLOAT) output.putFloat(0f)
                     else output.putShort(0)
                 }
             } else {
-                // The maximum peak in the complete look-ahead window controls the delayed frame.
-                var windowPeak = 0f
-                for (frame in limiterBuffer.indices) {
-                    for (channel in 0 until channels) {
-                        windowPeak = maxOf(windowPeak, abs(limiterBuffer[frame][channel]))
-                    }
-                }
-
+                // The deque head is the maximum peak across the complete look-ahead window.
+                val windowPeak = if (peakDequeCount > 0) peakDequeValues[peakDequeHead] else 0f
                 val targetGain = if (windowPeak > limiterThreshold) {
                     limiterThreshold / windowPeak
                 } else {
                     1f
                 }
 
-                // Fast attack prevents peaks; slower release avoids pumping on every transient.
+                // Immediate attack and smooth release keep transient control without per-frame scans.
                 limiterGain = if (targetGain < limiterGain) {
                     targetGain
                 } else {
                     limiterGain + (targetGain - limiterGain) * limiterReleaseCoefficient
                 }
 
-                val oldestFrame = limiterBuffer[limiterWriteIndex]
+                val delayedFrame = limiterBuffer[limiterWriteIndex]
                 repeat(channels) { channel ->
-                    val limited = (oldestFrame[channel] * limiterGain)
+                    val limited = (delayedFrame[channel] * limiterGain)
                         .coerceIn(-limiterThreshold, limiterThreshold)
                     if (encoding == C.ENCODING_PCM_FLOAT) {
                         output.putFloat(limited)
@@ -196,6 +212,8 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
                     }
                 }
             }
+
+            limiterFramesProcessed++
         }
 
         input.position(input.position() + (availableBytes - byteCount))
@@ -204,8 +222,12 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
 
     private fun prepareLimiter() {
         // 3 ms of look-ahead is a practical compromise for mobile CPU and transient control.
-        val lookAheadFrames = (sampleRate * 3 / 1000).coerceAtLeast(1)
-        limiterBuffer = Array(lookAheadFrames + 1) { FloatArray(channels) }
+        limiterLookAheadFrames = (sampleRate * 3 / 1000).coerceAtLeast(1)
+        limiterBuffer = Array(limiterLookAheadFrames + 1) { FloatArray(channels) }
+        // A monotonic deque stores only candidate peaks: total work is O(1) amortized per frame.
+        val dequeCapacity = limiterLookAheadFrames + 2
+        peakDequeIndices = LongArray(dequeCapacity)
+        peakDequeValues = FloatArray(dequeCapacity)
         limiterReleaseCoefficient = (1.0 - exp(-1.0 / (sampleRate * 0.075))).toFloat()
     }
 
@@ -255,7 +277,11 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         eqZ2 = Array(bandFrequencies.size) { FloatArray(channels) }
         for (frame in limiterBuffer) frame.fill(0f)
         limiterWriteIndex = 0
-        limiterFilledFrames = 0
         limiterGain = 1f
+        limiterFramesProcessed = 0L
+        peakDequeHead = 0
+        peakDequeCount = 0
+        peakDequeIndices.fill(0L)
+        peakDequeValues.fill(0f)
     }
 }
