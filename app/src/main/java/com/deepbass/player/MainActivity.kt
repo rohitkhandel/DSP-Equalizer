@@ -1,5 +1,6 @@
 package com.deepbass.player
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -25,8 +26,9 @@ import androidx.compose.ui.unit.sp
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.audio.AudioProcessor
-import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 
 class MainActivity : ComponentActivity() {
@@ -36,17 +38,30 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 fun DeepBassScreen() {
     val context = LocalContext.current
     val processor = remember { DeepBassAudioProcessor() }
-    val player = remember {
-        val sink = DefaultAudioSink.Builder(context)
-            .setAudioProcessors(arrayOf<AudioProcessor>(processor))
-            .build()
-        val renderers = DefaultRenderersFactory(context).setAudioSink(sink)
-        ExoPlayer.Builder(context, renderers).build()
+    val renderersFactory = remember(processor) {
+        object : DefaultRenderersFactory(context) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioOutputPlaybackParams: Boolean
+            ): AudioSink? {
+                // Float output is kept disabled so PCM processing remains active.
+                return DefaultAudioSink.Builder(context)
+                    .setAudioProcessors(arrayOf<AudioProcessor>(processor))
+                    .setEnableFloatOutput(false)
+                    .build()
+            }
+        }
     }
+    val player = remember(renderersFactory) {
+        ExoPlayer.Builder(context, renderersFactory).build()
+    }
+
     var selectedSong by remember { mutableStateOf("No track selected") }
     var isPlaying by remember { mutableStateOf(false) }
     var bass by remember { mutableFloatStateOf(38f) }
@@ -99,7 +114,7 @@ fun DeepBassScreen() {
                     Spacer(Modifier.width(10.dp))
                     Text("DEEPBASS", color = Color.White, fontSize = 22.sp)
                     Spacer(Modifier.weight(1f))
-                    Text("DSP BETA 0.3", color = Color.Gray, fontSize = 12.sp)
+                    Text("DSP BETA 0.4", color = Color.Gray, fontSize = 12.sp)
                 }
                 Text("Subwoofer-style depth.", color = Color.White, fontSize = 27.sp)
                 Text("Deep low-end • Tight punch • Clear vocals", color = Color.LightGray)
