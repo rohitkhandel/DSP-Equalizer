@@ -13,13 +13,9 @@ import org.junit.Test
 class DeepBassAudioProcessorTest {
 
     @Test
-    fun pcmInputProducesCompleteFiniteOutputBuffer() {
+    fun pcmInputProducesImmediateCompleteFiniteOutput() {
         val processor = configuredProcessor(
-            bass = 0f,
-            punch = 0f,
-            vocal = 0f,
-            preamp = 0f,
-            gains = FloatArray(10)
+            bass = 0f, punch = 0f, vocal = 0f, preamp = 0f, gains = FloatArray(10)
         )
         val input = makeToneBuffer(frameCount = 8192, frequencyHz = 440f)
         val inputBytes = input.remaining()
@@ -27,35 +23,52 @@ class DeepBassAudioProcessorTest {
         processor.queueInput(input)
         val output = processor.output.order(ByteOrder.nativeOrder())
 
-        assertEquals("DSP must not truncate PCM frames", inputBytes, output.remaining())
-        var nonZeroSamples = 0
+        assertEquals("DSP must preserve every PCM frame", inputBytes, output.remaining())
+        var firstNonZeroSample = -1
+        var sampleIndex = 0
         while (output.remaining() >= 2) {
-            if (output.short.toInt() != 0) nonZeroSamples++
+            if (output.short.toInt() != 0 && firstNonZeroSample < 0) {
+                firstNonZeroSample = sampleIndex
+            }
+            sampleIndex++
         }
-        assertTrue("Processed audio should contain audible samples", nonZeroSamples > 1000)
+        assertTrue("Audio must not be held back by a look-ahead delay", firstNonZeroSample in 0..3)
+    }
+
+    @Test
+    fun bassControlChangesLowFrequencySignal() {
+        val flatEnergy = renderEnergy(
+            frequencyHz = 45f, bass = 0f, punch = 0f, vocal = 0f, gains = FloatArray(10)
+        )
+        val bassEnergy = renderEnergy(
+            frequencyHz = 45f, bass = 100f, punch = 0f, vocal = 0f, gains = FloatArray(10)
+        )
+        assertTrue("Bass control must noticeably increase low-frequency energy", bassEnergy > flatEnergy * 1.8)
     }
 
     @Test
     fun equalizerGainChangesProcessedSignal() {
-        val flat = renderEnergy(FloatArray(10))
-        val boostedGains = FloatArray(10).also { it[5] = 8f }
-        val boosted = renderEnergy(boostedGains)
-
-        assertTrue(
-            "A +8 dB 1 kHz band must measurably change a 1 kHz tone",
-            boosted > flat * 1.5
+        val flat = renderEnergy(
+            frequencyHz = 1000f, bass = 0f, punch = 0f, vocal = 0f, gains = FloatArray(10)
         )
+        val boostedGains = FloatArray(10).also { it[5] = 8f }
+        val boosted = renderEnergy(
+            frequencyHz = 1000f, bass = 0f, punch = 0f, vocal = 0f, gains = boostedGains
+        )
+        assertTrue("A +8 dB 1 kHz band must measurably change the signal", boosted > flat * 1.5)
     }
 
-    private fun renderEnergy(gains: FloatArray): Double {
+    private fun renderEnergy(
+        frequencyHz: Float,
+        bass: Float,
+        punch: Float,
+        vocal: Float,
+        gains: FloatArray
+    ): Double {
         val processor = configuredProcessor(
-            bass = 0f,
-            punch = 0f,
-            vocal = 0f,
-            preamp = 0f,
-            gains = gains
+            bass = bass, punch = punch, vocal = vocal, preamp = 0f, gains = gains
         )
-        val input = makeToneBuffer(frameCount = 8192, frequencyHz = 1000f)
+        val input = makeToneBuffer(frameCount = 8192, frequencyHz = frequencyHz)
         processor.queueInput(input)
         val output = processor.output.order(ByteOrder.nativeOrder())
 
