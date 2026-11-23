@@ -1,6 +1,6 @@
 package com.deepbass.player
 
-import android.content.Context
+import android.content.ComponentName
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -25,13 +25,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.common.audio.AudioProcessor
-import androidx.media3.exoplayer.DefaultRenderersFactory
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.exoplayer.audio.AudioSink
-import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -40,70 +38,92 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(androidx.media3.common.util.UnstableApi::class)
 @Composable
 fun DeepBassScreen() {
     val context = LocalContext.current
-    val processor = remember { DeepBassAudioProcessor() }
-    val renderersFactory = remember(processor) {
-        object : DefaultRenderersFactory(context) {
-            override fun buildAudioSink(
-                context: Context,
-                enableFloatOutput: Boolean,
-                enableAudioOutputPlaybackParams: Boolean
-            ): AudioSink? {
-                return DefaultAudioSink.Builder(context)
-                    .setAudioProcessors(arrayOf<AudioProcessor>(processor))
-                    .setEnableFloatOutput(false)
-                    .build()
-            }
-        }
-    }
-    val player = remember(renderersFactory) {
-        ExoPlayer.Builder(context, renderersFactory).build()
-    }
-
     val eqFrequencies = listOf("31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz")
+
     var selectedSong by remember { mutableStateOf("No track selected") }
     var isPlaying by remember { mutableStateOf(false) }
-    var bass by remember { mutableFloatStateOf(38f) }
-    var punch by remember { mutableFloatStateOf(30f) }
-    var vocal by remember { mutableFloatStateOf(24f) }
-    var preamp by remember { mutableFloatStateOf(-4f) }
+    var connectionReady by remember { mutableStateOf(false) }
+    var bass by remember { mutableFloatStateOf(34f) }
+    var punch by remember { mutableFloatStateOf(28f) }
+    var vocal by remember { mutableFloatStateOf(26f) }
+    var preamp by remember { mutableFloatStateOf(-5f) }
     var eqGains by remember {
-        mutableStateOf(listOf(2f, 3f, 2f, 0.5f, -0.5f, 0f, 0.5f, 1f, 1f, 0.5f))
+        mutableStateOf(listOf(1.5f, 2.5f, 1.5f, 0f, -0.5f, 0f, 0.5f, 1f, 1f, 0.5f))
     }
 
-    LaunchedEffect(bass, punch, vocal, preamp, eqGains) {
-        processor.bassAmount = bass / 100f
-        processor.punchAmount = punch / 100f
-        processor.vocalAmount = vocal / 100f
-        processor.preampDb = preamp
-        processor.setEqualizerGains(eqGains.toFloatArray())
+    val sessionToken = remember(context) {
+        SessionToken(context, ComponentName(context, DeepBassPlaybackService::class.java))
     }
+    val controllerFuture = remember(sessionToken) {
+        MediaController.Builder(context, sessionToken).buildAsync()
+    }
+    var mediaController by remember { mutableStateOf<MediaController?>(null) }
 
-    DisposableEffect(player) {
-        val listener = object : Player.Listener {
-            override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
-            }
-        }
-        player.addListener(listener)
+    DisposableEffect(controllerFuture) {
+        controllerFuture.addListener(
+            {
+                try {
+                    mediaController = controllerFuture.get()
+                    connectionReady = true
+                } catch (_: Exception) {
+                    connectionReady = false
+                }
+            },
+            ContextCompat.getMainExecutor(context)
+        )
         onDispose {
-            player.removeListener(listener)
-            player.release()
+            MediaController.releaseFuture(controllerFuture)
+            mediaController = null
+        }
+    }
+
+    DisposableEffect(mediaController) {
+        val controller = mediaController
+        if (controller == null) {
+            onDispose { }
+        } else {
+            val listener = object : Player.Listener {
+                override fun onIsPlayingChanged(playing: Boolean) {
+                    isPlaying = playing
+                }
+
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    selectedSong = mediaItem?.mediaMetadata?.title?.toString()
+                        ?: selectedSong
+                }
+            }
+            controller.addListener(listener)
+            isPlaying = controller.isPlaying
+            onDispose { controller.removeListener(listener) }
+        }
+    }
+
+    LaunchedEffect(mediaController, bass, punch, vocal, preamp, eqGains) {
+        if (mediaController != null) {
+            DeepBassPlaybackService.updateDsp(
+                bass, punch, vocal, preamp, eqGains.toFloatArray()
+            )
         }
     }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        uri?.let {
+        uri?.let { selectedUri ->
             try {
-                context.contentResolver.takePersistableUriPermission(it, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                context.contentResolver.takePersistableUriPermission(
+                    selectedUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
             } catch (_: SecurityException) { }
-            selectedSong = it.lastPathSegment?.substringAfterLast('/') ?: "Selected audio file"
-            player.setMediaItem(MediaItem.fromUri(it))
-            player.prepare()
-            player.play()
+            selectedSong = selectedUri.lastPathSegment?.substringAfterLast('/')
+                ?: "Selected audio file"
+            mediaController?.let { controller ->
+                controller.setMediaItem(MediaItem.fromUri(selectedUri))
+                controller.prepare()
+                controller.play()
+            }
         }
     }
 
@@ -122,7 +142,7 @@ fun DeepBassScreen() {
                     Spacer(Modifier.width(10.dp))
                     Text("DEEPBASS", color = Color.White, fontSize = 22.sp)
                     Spacer(Modifier.weight(1f))
-                    Text("DSP BETA 0.5", color = Color.Gray, fontSize = 12.sp)
+                    Text("DSP BETA 0.7", color = Color.Gray, fontSize = 12.sp)
                 }
                 Text("Subwoofer-style depth.", color = Color.White, fontSize = 27.sp)
                 Text("Deep low-end • Tight punch • Clear vocals", color = Color.LightGray)
@@ -138,18 +158,21 @@ fun DeepBassScreen() {
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
                                 onClick = { picker.launch(arrayOf("audio/*")) },
+                                enabled = connectionReady,
                                 modifier = Modifier.weight(1f)
                             ) {
                                 Icon(Icons.Default.FolderOpen, null)
                                 Spacer(Modifier.width(7.dp))
-                                Text("Choose song")
+                                Text(if (connectionReady) "Choose song" else "Connecting player…")
                             }
                             FilledTonalButton(
                                 onClick = {
-                                    if (player.isPlaying) player.pause()
-                                    else if (player.mediaItemCount > 0) player.play()
+                                    mediaController?.let { controller ->
+                                        if (controller.isPlaying) controller.pause()
+                                        else if (controller.mediaItemCount > 0) controller.play()
+                                    }
                                 },
-                                enabled = player.mediaItemCount > 0,
+                                enabled = connectionReady && (mediaController?.mediaItemCount ?: 0) > 0,
                                 modifier = Modifier.width(58.dp)
                             ) {
                                 Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, "Play or pause")
@@ -196,13 +219,14 @@ fun DeepBassScreen() {
 
                 Surface(color = Color(0xFF203020), shape = RoundedCornerShape(50)) {
                     Text(
-                        "Custom PCM DSP active • Local processing",
+                        if (connectionReady) "Background player connected • DSP active"
+                        else "Connecting to local playback service…",
                         color = Color(0xFFB7F36B),
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
                         fontSize = 11.sp
                     )
                 }
-                Text("No account • No uploads • No cloud audio processing", color = Color.Gray, fontSize = 11.sp)
+                Text("Local playback • System media notification • No audio uploads", color = Color.Gray, fontSize = 11.sp)
             }
         }
     }
@@ -244,11 +268,6 @@ private fun EqBandControl(
                 fontSize = 11.sp
             )
         }
-        Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = -12f..12f,
-            steps = 47
-        )
+        Slider(value = value, onValueChange = onValueChange, valueRange = -12f..12f, steps = 47)
     }
 }
