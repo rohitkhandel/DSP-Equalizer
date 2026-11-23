@@ -67,9 +67,10 @@ object OfflineWavExporter {
                 ?: error("Audio format is missing its decoder type.")
             extractor.selectTrack(audioTrackIndex)
 
-            decoder = MediaCodec.createDecoderByType(mime)
-            decoder.configure(sourceFormat, null, null, 0)
-            decoder.start()
+            val activeDecoder = MediaCodec.createDecoderByType(mime)
+            decoder = activeDecoder
+            activeDecoder.configure(sourceFormat, null, null, 0)
+            activeDecoder.start()
 
             val dsp = DeepBassAudioProcessor().apply {
                 bassAmount = settings.bass.coerceIn(0f, 100f) / 100f
@@ -145,11 +146,11 @@ object OfflineWavExporter {
                     workContext.ensureActive()
 
                     if (!inputEnded) {
-                        val inputIndex = decoder.dequeueInputBuffer(timeoutUs)
+                        val inputIndex = activeDecoder.dequeueInputBuffer(timeoutUs)
                         if (inputIndex >= 0) {
-                            val inputBuffer = decoder.getInputBuffer(inputIndex)
+                            val inputBuffer = activeDecoder.getInputBuffer(inputIndex)
                             if (inputBuffer == null) {
-                                decoder.queueInputBuffer(
+                                activeDecoder.queueInputBuffer(
                                     inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                 )
                                 inputEnded = true
@@ -157,12 +158,12 @@ object OfflineWavExporter {
                                 inputBuffer.clear()
                                 val sampleSize = extractor.readSampleData(inputBuffer, 0)
                                 if (sampleSize < 0) {
-                                    decoder.queueInputBuffer(
+                                    activeDecoder.queueInputBuffer(
                                         inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                                     )
                                     inputEnded = true
                                 } else {
-                                    decoder.queueInputBuffer(
+                                    activeDecoder.queueInputBuffer(
                                         inputIndex, 0, sampleSize, extractor.sampleTime, 0
                                     )
                                     extractor.advance()
@@ -171,19 +172,19 @@ object OfflineWavExporter {
                         }
                     }
 
-                    val outputIndex = decoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
+                    val outputIndex = activeDecoder.dequeueOutputBuffer(bufferInfo, timeoutUs)
                     when {
                         outputIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> Unit
 
                         outputIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                            configureDsp(decoder.outputFormat)
+                            configureDsp(activeDecoder.outputFormat)
                         }
 
                         outputIndex >= 0 -> {
                             if (bufferInfo.size > 0) {
-                                if (!processorConfigured) configureDsp(decoder.outputFormat)
+                                if (!processorConfigured) configureDsp(activeDecoder.outputFormat)
 
-                                val decodedBuffer = decoder.getOutputBuffer(outputIndex)
+                                val decodedBuffer = activeDecoder.getOutputBuffer(outputIndex)
                                     ?: error("Decoder returned an empty audio buffer.")
                                 decodedBuffer.position(bufferInfo.offset)
                                 decodedBuffer.limit(bufferInfo.offset + bufferInfo.size)
@@ -195,7 +196,7 @@ object OfflineWavExporter {
 
                             val endOfStream =
                                 (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                            decoder.releaseOutputBuffer(outputIndex, false)
+                            activeDecoder.releaseOutputBuffer(outputIndex, false)
                             if (endOfStream) outputEnded = true
                         }
                     }
