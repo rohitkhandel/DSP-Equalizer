@@ -1,8 +1,6 @@
 package com.deepbass.player
 
 import android.content.Intent
-import android.media.audiofx.BassBoost
-import android.media.audiofx.Equalizer
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -26,10 +24,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
-import androidx.media3.common.util.UnstableApi
+import androidx.media3.common.audio.AudioProcessor
 import androidx.media3.exoplayer.ExoPlayer
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
+import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.audio.DefaultAudioSink
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -38,81 +36,39 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(UnstableApi::class)
 @Composable
 fun DeepBassScreen() {
     val context = LocalContext.current
-    val player = remember { ExoPlayer.Builder(context).build() }
+    val processor = remember { DeepBassAudioProcessor() }
+    val player = remember {
+        val sink = DefaultAudioSink.Builder(context)
+            .setAudioProcessors(arrayOf<AudioProcessor>(processor))
+            .build()
+        val renderers = DefaultRenderersFactory(context).setAudioSink(sink)
+        ExoPlayer.Builder(context, renderers).build()
+    }
     var selectedSong by remember { mutableStateOf("No track selected") }
     var isPlaying by remember { mutableStateOf(false) }
-    var audioSessionId by remember { mutableIntStateOf(0) }
-    var bass by remember { mutableFloatStateOf(35f) }
-    var punch by remember { mutableFloatStateOf(25f) }
-    var vocal by remember { mutableFloatStateOf(20f) }
-    var effectsAvailable by remember { mutableStateOf(false) }
-    var bassEffect by remember { mutableStateOf<BassBoost?>(null) }
-    var equalizer by remember { mutableStateOf<Equalizer?>(null) }
+    var bass by remember { mutableFloatStateOf(38f) }
+    var punch by remember { mutableFloatStateOf(30f) }
+    var vocal by remember { mutableFloatStateOf(24f) }
+
+    SideEffect {
+        processor.bassAmount = bass / 100f
+        processor.punchAmount = punch / 100f
+        processor.vocalAmount = vocal / 100f
+    }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = playing
             }
-            override fun onAudioSessionIdChanged(id: Int) {
-                audioSessionId = id
-            }
         }
         player.addListener(listener)
         onDispose {
             player.removeListener(listener)
-            bassEffect?.release()
-            equalizer?.release()
             player.release()
-        }
-    }
-
-    LaunchedEffect(audioSessionId) {
-        bassEffect?.release()
-        equalizer?.release()
-        bassEffect = null
-        equalizer = null
-        effectsAvailable = false
-        if (audioSessionId > 0) {
-            try {
-                val bb = withContext(Dispatchers.IO) { BassBoost(0, audioSessionId) }
-                val eq = withContext(Dispatchers.IO) { Equalizer(0, audioSessionId) }
-                bb.enabled = true
-                eq.enabled = true
-                bassEffect = bb
-                equalizer = eq
-                effectsAvailable = true
-            } catch (_: Exception) {
-                effectsAvailable = false
-            }
-        }
-    }
-
-    LaunchedEffect(bass, punch, vocal, effectsAvailable) {
-        val bb = bassEffect
-        val eq = equalizer
-        if (effectsAvailable && bb != null && eq != null) {
-            try {
-                bb.setStrength((bass * 10).toInt().coerceIn(0, 1000).toShort())
-                val range = eq.bandLevelRange
-                val maxBoost = range[1].toInt()
-                for (index in 0 until eq.numberOfBands.toInt()) {
-                    val band = index.toShort()
-                    val hz = eq.getCenterFreq(band) / 1000
-                    val gain = when {
-                        hz in 45..160 -> (punch * 5.0f).toInt()
-                        hz in 1000..5000 -> (vocal * 3.0f).toInt()
-                        else -> 0
-                    }.coerceAtMost(maxBoost)
-                    eq.setBandLevel(band, gain.toShort())
-                }
-            } catch (_: Exception) {
-                effectsAvailable = false
-            }
         }
     }
 
@@ -124,7 +80,6 @@ fun DeepBassScreen() {
             selectedSong = it.lastPathSegment?.substringAfterLast('/') ?: "Selected audio file"
             player.setMediaItem(MediaItem.fromUri(it))
             player.prepare()
-            player.volume = 0.82f
             player.play()
         }
     }
@@ -144,10 +99,10 @@ fun DeepBassScreen() {
                     Spacer(Modifier.width(10.dp))
                     Text("DEEPBASS", color = Color.White, fontSize = 22.sp)
                     Spacer(Modifier.weight(1f))
-                    Text("BETA 0.2", color = Color.Gray, fontSize = 12.sp)
+                    Text("DSP BETA 0.3", color = Color.Gray, fontSize = 12.sp)
                 }
-                Text("Feel the depth.", color = Color.White, fontSize = 30.sp)
-                Text("Smooth low-end. Clear vocals.", color = Color.LightGray)
+                Text("Subwoofer-style depth.", color = Color.White, fontSize = 27.sp)
+                Text("Deep low-end • Tight punch • Clear vocals", color = Color.LightGray)
                 Card(
                     colors = CardDefaults.cardColors(containerColor = Color(0xFF151922)),
                     shape = RoundedCornerShape(22.dp)
@@ -180,28 +135,19 @@ fun DeepBassScreen() {
                     }
                 }
                 Text("BASS & TONE", color = Color.White, fontSize = 16.sp)
-                ControlSlider("Deep Bass", bass, { bass = it }, "Sub-bass weight")
-                ControlSlider("Punch", punch, { punch = it }, "Kick and bass impact")
-                ControlSlider("Vocal Clarity", vocal, { vocal = it }, "Gentle upper-mid presence")
+                ControlSlider("Sub-bass depth", bass, { bass = it }, "Low-frequency weight and rumble")
+                ControlSlider("Punch", punch, { punch = it }, "Tighter kick and mid-bass impact")
+                ControlSlider("Vocal clarity", vocal, { vocal = it }, "Gentle vocal-presence lift")
                 Spacer(Modifier.weight(1f))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Surface(
-                        color = if (effectsAvailable) Color(0xFF203020) else Color(0xFF292929),
-                        shape = RoundedCornerShape(50)
-                    ) {
-                        Text(
-                            if (effectsAvailable) "Audio effects active" else "Choose and play a song to initialise effects",
-                            color = if (effectsAvailable) Color(0xFFB7F36B) else Color.LightGray,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                            fontSize = 11.sp
-                        )
-                    }
+                Surface(color = Color(0xFF203020), shape = RoundedCornerShape(50)) {
+                    Text(
+                        "Custom PCM DSP active • Local processing",
+                        color = Color(0xFFB7F36B),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        fontSize = 11.sp
+                    )
                 }
-                Text(
-                    "Local playback • No account • No uploads",
-                    color = Color.Gray,
-                    fontSize = 11.sp
-                )
+                Text("No account • No uploads • No cloud audio processing", color = Color.Gray, fontSize = 11.sp)
             }
         }
     }
