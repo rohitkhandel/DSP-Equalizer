@@ -1,287 +1,326 @@
 package com.deepbass.player
 
-import androidx.media3.common.C
-import androidx.media3.common.audio.AudioProcessor
-import androidx.media3.common.audio.BaseAudioProcessor
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import kotlin.math.PI
-import kotlin.math.abs
-import kotlin.math.cos
-import kotlin.math.exp
-import kotlin.math.pow
-import kotlin.math.sin
+import android.content.ComponentName
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
+import kotlinx.coroutines.launch
 
-/**
- * Local real-time PCM processor:
- * 10-band peaking EQ, sub-bass, punch, vocal presence, preamp and a
- * 3 ms look-ahead peak limiter with a smooth release.
- */
-class DeepBassAudioProcessor : BaseAudioProcessor() {
-    @Volatile var bassAmount: Float = 0.34f
-    @Volatile var punchAmount: Float = 0.28f
-    @Volatile var vocalAmount: Float = 0.26f
-    @Volatile var preampDb: Float = -5.0f
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { DeepBassScreen() }
+    }
+}
 
-    private val bandFrequencies = floatArrayOf(
-        31f, 62f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f
-    )
+@Composable
+fun DeepBassScreen() {
+    val context = LocalContext.current
+    val eqFrequencies = listOf("31 Hz", "62 Hz", "125 Hz", "250 Hz", "500 Hz", "1 kHz", "2 kHz", "4 kHz", "8 kHz", "16 kHz")
 
-    private data class Biquad(
-        val b0: Float,
-        val b1: Float,
-        val b2: Float,
-        val a1: Float,
-        val a2: Float
-    )
-
-    @Volatile private var equalizerGainsDb = floatArrayOf(
-        1.5f, 2.5f, 1.5f, 0f, -0.5f, 0f, 0.5f, 1f, 1f, 0.5f
-    )
-    @Volatile private var equalizerCoefficients: Array<Biquad> = emptyArray()
-
-    private var sampleRate = 48000
-    private var channels = 2
-
-    private var subAlpha = 0.0f
-    private var lowAlpha = 0.0f
-    private var presenceHighAlpha = 0.0f
-    private var presenceLowAlpha = 0.0f
-
-    private var subState = FloatArray(channels)
-    private var lowState = FloatArray(channels)
-    private var presenceHighState = FloatArray(channels)
-    private var presenceLowState = FloatArray(channels)
-    private var eqZ1 = Array(bandFrequencies.size) { FloatArray(channels) }
-    private var eqZ2 = Array(bandFrequencies.size) { FloatArray(channels) }
-
-    // Circular look-ahead audio buffer. Each frame stores all channels together.
-    private var limiterBuffer = Array(2) { FloatArray(channels) }
-    private var limiterWriteIndex = 0
-    private var limiterGain = 1.0f
-    private var limiterReleaseCoefficient = 0.0f
-    private var limiterLookAheadFrames = 1
-    private var limiterFramesProcessed = 0L
-    private var peakDequeIndices = LongArray(4)
-    private var peakDequeValues = FloatArray(4)
-    private var peakDequeHead = 0
-    private var peakDequeCount = 0
-    private val limiterThreshold = 0.90f
-
-    init {
-        rebuildEqualizer()
+    var selectedSong by remember { mutableStateOf("No track selected") }
+    var selectedAudioUri by remember { mutableStateOf<Uri?>(null) }
+    var exportStatus by remember { mutableStateOf("") }
+    val coroutineScope = rememberCoroutineScope()
+    var isPlaying by remember { mutableStateOf(false) }
+    var connectionReady by remember { mutableStateOf(false) }
+    var bass by remember { mutableFloatStateOf(55f) }
+    var punch by remember { mutableFloatStateOf(42f) }
+    var vocal by remember { mutableFloatStateOf(40f) }
+    var preamp by remember { mutableFloatStateOf(0f) }
+    var eqGains by remember {
+        mutableStateOf(List(10) { 0f })
     }
 
-    fun setEqualizerGains(gainsDb: FloatArray) {
-        equalizerGainsDb = FloatArray(bandFrequencies.size) { index ->
-            gainsDb.getOrElse(index) { 0f }.coerceIn(-12f, 12f)
+    val sessionToken = remember(context) {
+        SessionToken(context, ComponentName(context, DeepBassPlaybackService::class.java))
+    }
+    val controllerFuture = remember(sessionToken) {
+        MediaController.Builder(context, sessionToken).buildAsync()
+    }
+    var mediaController by remember { mutableStateOf<MediaController?>(null) }
+
+    DisposableEffect(controllerFuture) {
+        controllerFuture.addListener(
+            {
+                try {
+                    mediaController = controllerFuture.get()
+                    connectionReady = true
+                } catch (_: Exception) {
+                    connectionReady = false
+                }
+            },
+            ContextCompat.getMainExecutor(context)
+        )
+        onDispose {
+            MediaController.releaseFuture(controllerFuture)
+            mediaController = null
         }
-        rebuildEqualizer()
     }
 
-    override fun onConfigure(inputAudioFormat: AudioProcessor.AudioFormat): AudioProcessor.AudioFormat {
-        if (inputAudioFormat.encoding != C.ENCODING_PCM_16BIT &&
-            inputAudioFormat.encoding != C.ENCODING_PCM_FLOAT
-        ) {
-            return AudioProcessor.AudioFormat.NOT_SET
+    DisposableEffect(mediaController) {
+        val controller = mediaController
+        if (controller == null) {
+            onDispose { }
+        } else {
+            val listener = object : Player.Listener {
+                override fun onIsPlayingChanged(playing: Boolean) {
+                    isPlaying = playing
+                }
+
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    selectedSong = mediaItem?.mediaMetadata?.title?.toString()
+                        ?: selectedSong
+                }
+            }
+            controller.addListener(listener)
+            isPlaying = controller.isPlaying
+            onDispose { controller.removeListener(listener) }
         }
-
-        sampleRate = inputAudioFormat.sampleRate.coerceAtLeast(8000)
-        channels = inputAudioFormat.channelCount.coerceAtLeast(1)
-        subAlpha = calculateAlpha(48f)
-        lowAlpha = calculateAlpha(145f)
-        presenceHighAlpha = calculateAlpha(950f)
-        presenceLowAlpha = calculateAlpha(4200f)
-        rebuildEqualizer()
-        prepareLimiter()
-        resetStates()
-        return inputAudioFormat
     }
 
-    override fun onFlush() {
-        resetStates()
+    LaunchedEffect(mediaController, bass, punch, vocal, preamp, eqGains) {
+        if (mediaController != null) {
+            DeepBassPlaybackService.updateDsp(
+                bass, punch, vocal, preamp, eqGains.toFloatArray()
+            )
+        }
     }
 
-    override fun queueInput(inputBuffer: ByteBuffer) {
-        val input = inputBuffer.order(ByteOrder.nativeOrder())
-        val encoding = inputAudioFormat.encoding
-        val bytesPerSample = if (encoding == C.ENCODING_PCM_FLOAT) 4 else 2
-        val frameBytes = channels * bytesPerSample
-        val availableBytes = input.remaining()
-        val byteCount = availableBytes - (availableBytes % frameBytes)
-        val output = replaceOutputBuffer(byteCount).order(ByteOrder.nativeOrder())
-        val frames = byteCount / frameBytes
-
-        val bassGain = bassAmount.coerceIn(0f, 1f) * 0.88f
-        val punchGain = punchAmount.coerceIn(0f, 1f) * 0.38f
-        val vocalGain = vocalAmount.coerceIn(0f, 1f) * 0.10f
-        val preampGain = 10.0.pow(preampDb.coerceIn(-12f, 0f) / 20.0).toFloat()
-        val coefficients = equalizerCoefficients
-
-        repeat(frames) {
-            var framePeak = 0f
-
-            // Decode and shape the frame, then store it in the look-ahead audio ring.
-            repeat(channels) { channel ->
-                val decoded = if (encoding == C.ENCODING_PCM_FLOAT) {
-                    input.float
-                } else {
-                    input.short / 32768.0f
-                }
-
-                var shaped = decoded * preampGain
-
-                // Ten peaking filters; their coefficients are prepared outside this audio loop.
-                for (band in coefficients.indices) {
-                    val c = coefficients[band]
-                    val z1 = eqZ1[band]
-                    val z2 = eqZ2[band]
-                    val filtered = c.b0 * shaped + z1[channel]
-                    z1[channel] = c.b1 * shaped - c.a1 * filtered + z2[channel]
-                    z2[channel] = c.b2 * shaped - c.a2 * filtered
-                    shaped = filtered
-                }
-
-                val sub = lowPass(shaped, channel, subAlpha, subState)
-                val low = lowPass(shaped, channel, lowAlpha, lowState)
-                val punchBand = low - (sub * 0.72f)
-                val presenceLow = lowPass(shaped, channel, presenceHighAlpha, presenceHighState)
-                val presenceHigh = shaped - presenceLow
-                val vocalBand = lowPass(presenceHigh, channel, presenceLowAlpha, presenceLowState)
-
-                val mixed = shaped +
-                    (sub * bassGain) +
-                    (punchBand * punchGain) +
-                    (vocalBand * vocalGain)
-                val safeSample = if (mixed.isFinite()) mixed else 0f
-                limiterBuffer[limiterWriteIndex][channel] = safeSample
-                framePeak = maxOf(framePeak, abs(safeSample))
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        uri?.let { selectedUri ->
+            try {
+                context.contentResolver.takePersistableUriPermission(
+                    selectedUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: SecurityException) { }
+            selectedAudioUri = selectedUri
+            exportStatus = ""
+            selectedSong = selectedUri.lastPathSegment?.substringAfterLast('/')
+                ?: "Selected audio file"
+            mediaController?.let { controller ->
+                controller.setMediaItem(MediaItem.fromUri(selectedUri))
+                controller.prepare()
+                controller.play()
             }
+        }
+    }
 
-            // Maintain a monotonic maximum queue. This replaces scanning every
-            // sample in the 3 ms look-ahead window (which was too expensive on mobile).
-            val currentFrameIndex = limiterFramesProcessed
-            while (peakDequeCount > 0) {
-                val tailPosition = (peakDequeHead + peakDequeCount - 1) % peakDequeIndices.size
-                if (peakDequeValues[tailPosition] > framePeak) break
-                peakDequeCount--
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("audio/wav")
+    ) { outputUri: Uri? ->
+        val inputUri = selectedAudioUri
+        if (outputUri != null && inputUri != null) {
+            val settings = DspExportSettings(
+                bass = bass,
+                punch = punch,
+                vocal = vocal,
+                preampDb = preamp,
+                equalizerGainsDb = eqGains.toFloatArray()
+            )
+            exportStatus = "Processing audio locally…"
+            coroutineScope.launch {
+                try {
+                    val writtenBytes = OfflineWavExporter.export(
+                        context = context,
+                        inputUri = inputUri,
+                        outputUri = outputUri,
+                        settings = settings
+                    )
+                    exportStatus = "WAV saved • ${(writtenBytes / 1024L).coerceAtLeast(1L)} KB"
+                } catch (error: Exception) {
+                    exportStatus = "Export failed: ${error.message ?: "Unsupported audio file"}"
+                }
             }
-            val newTail = (peakDequeHead + peakDequeCount) % peakDequeIndices.size
-            peakDequeIndices[newTail] = currentFrameIndex
-            peakDequeValues[newTail] = framePeak
-            peakDequeCount++
+        }
+    }
 
-            val oldestFrameIndex = currentFrameIndex - limiterLookAheadFrames
-            while (peakDequeCount > 0 && peakDequeIndices[peakDequeHead] < oldestFrameIndex) {
-                peakDequeHead = (peakDequeHead + 1) % peakDequeIndices.size
-                peakDequeCount--
-            }
-
-            // After the pointer advances, it points to the oldest delayed audio frame.
-            limiterWriteIndex = (limiterWriteIndex + 1) % limiterBuffer.size
-
-            if (currentFrameIndex < limiterLookAheadFrames) {
-                repeat(channels) {
-                    if (encoding == C.ENCODING_PCM_FLOAT) output.putFloat(0f)
-                    else output.putShort(0)
+    MaterialTheme(colorScheme = darkColorScheme(
+        primary = Color(0xFFB7F36B),
+        background = Color(0xFF090B0F),
+        surface = Color(0xFF151922)
+    )) {
+        Surface(Modifier.fillMaxSize(), color = Color(0xFF090B0F)) {
+            Column(
+                Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp),
+                verticalArrangement = Arrangement.spacedBy(15.dp)
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.GraphicEq, null, tint = Color(0xFFB7F36B))
+                    Spacer(Modifier.width(10.dp))
+                    Text("DEEPBASS", color = Color.White, fontSize = 22.sp)
+                    Spacer(Modifier.weight(1f))
+                    Text("DSP BETA 0.7", color = Color.Gray, fontSize = 12.sp)
                 }
-            } else {
-                // The deque head is the maximum peak across the complete look-ahead window.
-                val windowPeak = if (peakDequeCount > 0) peakDequeValues[peakDequeHead] else 0f
-                val targetGain = if (windowPeak > limiterThreshold) {
-                    limiterThreshold / windowPeak
-                } else {
-                    1f
-                }
-
-                // Immediate attack and smooth release keep transient control without per-frame scans.
-                limiterGain = if (targetGain < limiterGain) {
-                    targetGain
-                } else {
-                    limiterGain + (targetGain - limiterGain) * limiterReleaseCoefficient
-                }
-
-                val delayedFrame = limiterBuffer[limiterWriteIndex]
-                repeat(channels) { channel ->
-                    val limited = (delayedFrame[channel] * limiterGain)
-                        .coerceIn(-limiterThreshold, limiterThreshold)
-                    if (encoding == C.ENCODING_PCM_FLOAT) {
-                        output.putFloat(limited)
-                    } else {
-                        output.putShort((limited * 32767f).toInt().coerceIn(-32768, 32767).toShort())
+                Text("Subwoofer-style depth.", color = Color.White, fontSize = 27.sp)
+                Text("Deep low-end • Tight punch • Clear vocals", color = Color.LightGray)
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF151922)),
+                    shape = RoundedCornerShape(22.dp)
+                ) {
+                    Column(Modifier.fillMaxWidth().padding(20.dp)) {
+                        Text("NOW PLAYING", color = Color(0xFFB7F36B), fontSize = 11.sp)
+                        Spacer(Modifier.height(10.dp))
+                        Text(selectedSong, color = Color.White, fontSize = 16.sp, maxLines = 2)
+                        Spacer(Modifier.height(15.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = { picker.launch(arrayOf("audio/*")) },
+                                enabled = connectionReady,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(Icons.Default.FolderOpen, null)
+                                Spacer(Modifier.width(7.dp))
+                                Text(if (connectionReady) "Choose song" else "Connecting player…")
+                            }
+                            FilledTonalButton(
+                                onClick = {
+                                    mediaController?.let { controller ->
+                                        if (controller.isPlaying) controller.pause()
+                                        else if (controller.mediaItemCount > 0) controller.play()
+                                    }
+                                },
+                                enabled = connectionReady && (mediaController?.mediaItemCount ?: 0) > 0,
+                                modifier = Modifier.width(58.dp)
+                            ) {
+                                Icon(if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow, "Play or pause")
+                            }
+                        }
                     }
                 }
+
+                OutlinedButton(
+                    onClick = {
+                        val baseName = selectedSong
+                            .substringAfterLast('/')
+                            .substringBeforeLast('.', selectedSong)
+                            .take(60)
+                            .ifBlank { "DeepBass" }
+                        exportLauncher.launch("${baseName}_DeepBass.wav")
+                    },
+                    enabled = selectedAudioUri != null && connectionReady,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Export processed WAV")
+                }
+                if (exportStatus.isNotEmpty()) {
+                    Text(exportStatus, color = Color(0xFFB7F36B), fontSize = 11.sp)
+                }
+
+                Text("BASS & TONE", color = Color.White, fontSize = 16.sp)
+                ControlSlider("Sub-bass depth", bass, { bass = it }, "Low-frequency weight and rumble")
+                ControlSlider("Punch", punch, { punch = it }, "Tight kick and upper-bass impact")
+                ControlSlider("Vocal clarity", vocal, { vocal = it }, "Gentle vocal-presence lift")
+                Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Preamp / Headroom", color = Color.White)
+                        Spacer(Modifier.weight(1f))
+                        Text("${preamp.toInt()} dB", color = Color(0xFFB7F36B))
+                    }
+                    Slider(value = preamp, onValueChange = { preamp = it }, valueRange = -12f..0f, steps = 23)
+                    Text("Lower values make extra space for bass and EQ boosts", color = Color.Gray, fontSize = 10.sp)
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("10-BAND EQUALIZER", color = Color.White, fontSize = 16.sp)
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { eqGains = List(10) { 0f } }) { Text("Reset") }
+                }
+                for (index in 0 until 10 step 2) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        EqBandControl(
+                            eqFrequencies[index],
+                            eqGains[index],
+                            { value -> eqGains = eqGains.toMutableList().also { it[index] = value } },
+                            Modifier.weight(1f)
+                        )
+                        EqBandControl(
+                            eqFrequencies[index + 1],
+                            eqGains[index + 1],
+                            { value -> eqGains = eqGains.toMutableList().also { it[index + 1] = value } },
+                            Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                Surface(color = Color(0xFF203020), shape = RoundedCornerShape(50)) {
+                    Text(
+                        if (connectionReady) "Background player connected • DSP active"
+                        else "Connecting to local playback service…",
+                        color = Color(0xFFB7F36B),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        fontSize = 11.sp
+                    )
+                }
+                Text("Local playback • System media notification • No audio uploads", color = Color.Gray, fontSize = 11.sp)
             }
-
-            limiterFramesProcessed++
-        }
-
-        input.position(input.position() + (availableBytes - byteCount))
-        output.flip()
-    }
-
-    private fun prepareLimiter() {
-        // 3 ms of look-ahead is a practical compromise for mobile CPU and transient control.
-        limiterLookAheadFrames = (sampleRate * 3 / 1000).coerceAtLeast(1)
-        limiterBuffer = Array(limiterLookAheadFrames + 1) { FloatArray(channels) }
-        // A monotonic deque stores only candidate peaks: total work is O(1) amortized per frame.
-        val dequeCapacity = limiterLookAheadFrames + 2
-        peakDequeIndices = LongArray(dequeCapacity)
-        peakDequeValues = FloatArray(dequeCapacity)
-        limiterReleaseCoefficient = (1.0 - exp(-1.0 / (sampleRate * 0.075))).toFloat()
-    }
-
-    private fun rebuildEqualizer() {
-        val gains = equalizerGainsDb
-        val nyquistLimit = (sampleRate * 0.45f).coerceAtLeast(20f)
-        equalizerCoefficients = Array(bandFrequencies.size) { index ->
-            val frequency = bandFrequencies[index].coerceIn(20f, nyquistLimit)
-            createPeakingBiquad(frequency, gains.getOrElse(index) { 0f }.coerceIn(-12f, 12f), 1.05f)
         }
     }
+}
 
-    private fun createPeakingBiquad(frequency: Float, gainDb: Float, q: Float): Biquad {
-        val amplitude = 10.0.pow(gainDb / 40.0)
-        val omega = 2.0 * PI * frequency / sampleRate
-        val sine = sin(omega)
-        val cosine = cos(omega)
-        val alpha = sine / (2.0 * q)
-        val a0 = 1.0 + alpha / amplitude
-
-        return Biquad(
-            b0 = ((1.0 + alpha * amplitude) / a0).toFloat(),
-            b1 = ((-2.0 * cosine) / a0).toFloat(),
-            b2 = ((1.0 - alpha * amplitude) / a0).toFloat(),
-            a1 = ((-2.0 * cosine) / a0).toFloat(),
-            a2 = ((1.0 - alpha / amplitude) / a0).toFloat()
-        )
+@Composable
+private fun ControlSlider(
+    label: String,
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    helper: String
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(label, color = Color.White)
+            Spacer(Modifier.weight(1f))
+            Text("${value.toInt()}%", color = Color(0xFFB7F36B))
+        }
+        Slider(value = value, onValueChange = onValueChange, valueRange = 0f..100f)
+        Text(helper, color = Color.Gray, fontSize = 10.sp)
     }
+}
 
-    private fun calculateAlpha(cutoffHz: Float): Float {
-        val safeCutoff = cutoffHz.coerceIn(10f, sampleRate * 0.45f)
-        return (1.0 - exp(-2.0 * PI * safeCutoff / sampleRate)).toFloat()
-    }
-
-    private fun lowPass(input: Float, channel: Int, alpha: Float, state: FloatArray): Float {
-        val updated = state[channel] + alpha * (input - state[channel])
-        state[channel] = updated
-        return updated
-    }
-
-    private fun resetStates() {
-        subState = FloatArray(channels)
-        lowState = FloatArray(channels)
-        presenceHighState = FloatArray(channels)
-        presenceLowState = FloatArray(channels)
-        eqZ1 = Array(bandFrequencies.size) { FloatArray(channels) }
-        eqZ2 = Array(bandFrequencies.size) { FloatArray(channels) }
-        for (frame in limiterBuffer) frame.fill(0f)
-        limiterWriteIndex = 0
-        limiterGain = 1f
-        limiterFramesProcessed = 0L
-        peakDequeHead = 0
-        peakDequeCount = 0
-        peakDequeIndices.fill(0L)
-        peakDequeValues.fill(0f)
+@Composable
+private fun EqBandControl(
+    frequency: String,
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(1.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(frequency, color = Color.LightGray, fontSize = 11.sp)
+            Spacer(Modifier.weight(1f))
+            val displayed = (value * 2f).toInt() / 2f
+            Text(
+                if (displayed > 0f) "+$displayed dB" else "$displayed dB",
+                color = Color(0xFFB7F36B),
+                fontSize = 11.sp
+            )
+        }
+        Slider(value = value, onValueChange = onValueChange, valueRange = -12f..12f, steps = 47)
     }
 }
