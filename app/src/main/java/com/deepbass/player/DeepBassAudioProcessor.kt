@@ -13,15 +13,18 @@ import kotlin.math.pow
 import kotlin.math.sin
 
 /**
- * Local real-time PCM processor:
- * 10-band peaking EQ, sub-bass, punch, vocal presence, preamp and a
- * 3 ms look-ahead peak limiter with a smooth release.
+ * Low-latency PCM DSP for local playback.
+ *
+ * Processing is frame-based and allocation-free inside the sample loop:
+ * 10-band peaking EQ, sub-bass, punch, vocal presence, smoothed controls,
+ * and a linked stereo peak controller. There is no look-ahead audio queue,
+ * so playback does not acquire an artificial delay or lose a delayed tail.
  */
 class DeepBassAudioProcessor : BaseAudioProcessor() {
-    @Volatile var bassAmount: Float = 0.34f
-    @Volatile var punchAmount: Float = 0.28f
-    @Volatile var vocalAmount: Float = 0.26f
-    @Volatile var preampDb: Float = -5.0f
+    @Volatile var bassAmount: Float = 0.55f
+    @Volatile var punchAmount: Float = 0.42f
+    @Volatile var vocalAmount: Float = 0.40f
+    @Volatile var preampDb: Float = 0.0f
 
     private val bandFrequencies = floatArrayOf(
         31f, 62f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f
@@ -35,18 +38,18 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         val a2: Float
     )
 
-    @Volatile private var equalizerGainsDb = floatArrayOf(
-        1.5f, 2.5f, 1.5f, 0f, -0.5f, 0f, 0.5f, 1f, 1f, 0.5f
-    )
+    @Volatile private var equalizerGainsDb = FloatArray(bandFrequencies.size)
     @Volatile private var equalizerCoefficients: Array<Biquad> = emptyArray()
 
     private var sampleRate = 48000
     private var channels = 2
 
-    private var subAlpha = 0.0f
-    private var lowAlpha = 0.0f
-    private var presenceHighAlpha = 0.0f
-    private var presenceLowAlpha = 0.0f
+    private var subAlpha = 0f
+    private var lowAlpha = 0f
+    private var presenceHighAlpha = 0f
+    private var presenceLowAlpha = 0f
+    private var controlSmoothing = 0f
+    private var limiterRelease = 0f
 
     private var subState = FloatArray(channels)
     private var lowState = FloatArray(channels)
@@ -55,18 +58,14 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
     private var eqZ1 = Array(bandFrequencies.size) { FloatArray(channels) }
     private var eqZ2 = Array(bandFrequencies.size) { FloatArray(channels) }
 
-    // Circular look-ahead audio buffer. Each frame stores all channels together.
-    private var limiterBuffer = Array(2) { FloatArray(channels) }
-    private var limiterWriteIndex = 0
-    private var limiterGain = 1.0f
-    private var limiterReleaseCoefficient = 0.0f
-    private var limiterLookAheadFrames = 1
-    private var limiterFramesProcessed = 0L
-    private var peakDequeIndices = LongArray(4)
-    private var peakDequeValues = FloatArray(4)
-    private var peakDequeHead = 0
-    private var peakDequeCount = 0
-    private val limiterThreshold = 0.90f
+    private var smoothedBass = 0f
+    private var smoothedPunch = 0f
+    private var smoothedVocal = 0f
+    private var smoothedPreampGain = 1f
+    private var limiterEnvelope = 0f
+    private var limiterGain = 1f
+
+    private val limiterThreshold = 0.94f
 
     init {
         rebuildEqualizer()
@@ -92,8 +91,9 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         lowAlpha = calculateAlpha(145f)
         presenceHighAlpha = calculateAlpha(950f)
         presenceLowAlpha = calculateAlpha(4200f)
+        controlSmoothing = (1.0 - exp(-1.0 / (sampleRate * 0.008))).toFloat()
+        limiterRelease = (1.0 - exp(-1.0 / (sampleRate * 0.060))).toFloat()
         rebuildEqualizer()
-        prepareLimiter()
         resetStates()
         return inputAudioFormat
     }
@@ -112,16 +112,27 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         val output = replaceOutputBuffer(byteCount).order(ByteOrder.nativeOrder())
         val frames = byteCount / frameBytes
 
-        val bassGain = bassAmount.coerceIn(0f, 1f) * 0.88f
-        val punchGain = punchAmount.coerceIn(0f, 1f) * 0.38f
-        val vocalGain = vocalAmount.coerceIn(0f, 1f) * 0.10f
-        val preampGain = 10.0.pow(preampDb.coerceIn(-12f, 0f) / 20.0).toFloat()
+        val targetBass = bassAmount.coerceIn(0f, 1f)
+        val targetPunch = punchAmount.coerceIn(0f, 1f)
+        val targetVocal = vocalAmount.coerceIn(0f, 1f)
+        val targetPreampGain = 10.0.pow(preampDb.coerceIn(-12f, 0f) / 20.0).toFloat()
         val coefficients = equalizerCoefficients
+        val frameSamples = FloatArray(channels)
 
         repeat(frames) {
-            var framePeak = 0f
+            smoothedBass += (targetBass - smoothedBass) * controlSmoothing
+            smoothedPunch += (targetPunch - smoothedPunch) * controlSmoothing
+            smoothedVocal += (targetVocal - smoothedVocal) * controlSmoothing
+            smoothedPreampGain +=
+                (targetPreampGain - smoothedPreampGain) * controlSmoothing
 
-            // Decode and shape the frame, then store it in the look-ahead audio ring.
+            // Strong enough to be audible at normal slider positions, while
+            // the linked limiter below protects against digital clipping.
+            val bassGain = smoothedBass * 1.80f
+            val punchGain = smoothedPunch * 0.72f
+            val vocalGain = smoothedVocal * 0.18f
+
+            var framePeak = 0f
             repeat(channels) { channel ->
                 val decoded = if (encoding == C.ENCODING_PCM_FLOAT) {
                     input.float
@@ -129,9 +140,8 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
                     input.short / 32768.0f
                 }
 
-                var shaped = decoded * preampGain
+                var shaped = decoded * smoothedPreampGain
 
-                // Ten peaking filters; their coefficients are prepared outside this audio loop.
                 for (band in coefficients.indices) {
                     val c = coefficients[band]
                     val z1 = eqZ1[band]
@@ -145,90 +155,60 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
                 val sub = lowPass(shaped, channel, subAlpha, subState)
                 val low = lowPass(shaped, channel, lowAlpha, lowState)
                 val punchBand = low - (sub * 0.72f)
-                val presenceLow = lowPass(shaped, channel, presenceHighAlpha, presenceHighState)
+
+                val presenceLow = lowPass(
+                    shaped, channel, presenceHighAlpha, presenceHighState
+                )
                 val presenceHigh = shaped - presenceLow
-                val vocalBand = lowPass(presenceHigh, channel, presenceLowAlpha, presenceLowState)
+                val vocalBand = lowPass(
+                    presenceHigh, channel, presenceLowAlpha, presenceLowState
+                )
 
                 val mixed = shaped +
                     (sub * bassGain) +
                     (punchBand * punchGain) +
                     (vocalBand * vocalGain)
+
                 val safeSample = if (mixed.isFinite()) mixed else 0f
-                limiterBuffer[limiterWriteIndex][channel] = safeSample
+                frameSamples[channel] = safeSample
                 framePeak = maxOf(framePeak, abs(safeSample))
             }
 
-            // Maintain a monotonic maximum queue. This replaces scanning every
-            // sample in the 3 ms look-ahead window (which was too expensive on mobile).
-            val currentFrameIndex = limiterFramesProcessed
-            while (peakDequeCount > 0) {
-                val tailPosition = (peakDequeHead + peakDequeCount - 1) % peakDequeIndices.size
-                if (peakDequeValues[tailPosition] > framePeak) break
-                peakDequeCount--
-            }
-            val newTail = (peakDequeHead + peakDequeCount) % peakDequeIndices.size
-            peakDequeIndices[newTail] = currentFrameIndex
-            peakDequeValues[newTail] = framePeak
-            peakDequeCount++
-
-            val oldestFrameIndex = currentFrameIndex - limiterLookAheadFrames
-            while (peakDequeCount > 0 && peakDequeIndices[peakDequeHead] < oldestFrameIndex) {
-                peakDequeHead = (peakDequeHead + 1) % peakDequeIndices.size
-                peakDequeCount--
-            }
-
-            // After the pointer advances, it points to the oldest delayed audio frame.
-            limiterWriteIndex = (limiterWriteIndex + 1) % limiterBuffer.size
-
-            if (currentFrameIndex < limiterLookAheadFrames) {
-                repeat(channels) {
-                    if (encoding == C.ENCODING_PCM_FLOAT) output.putFloat(0f)
-                    else output.putShort(0)
-                }
+            // Linked-channel envelope control with instant attack and smooth
+            // release. This avoids the old circular look-ahead buffer, which
+            // added latency and could create start/seek transients.
+            limiterEnvelope = if (framePeak > limiterEnvelope) {
+                framePeak
             } else {
-                // The deque head is the maximum peak across the complete look-ahead window.
-                val windowPeak = if (peakDequeCount > 0) peakDequeValues[peakDequeHead] else 0f
-                val targetGain = if (windowPeak > limiterThreshold) {
-                    limiterThreshold / windowPeak
-                } else {
-                    1f
-                }
-
-                // Immediate attack and smooth release keep transient control without per-frame scans.
-                limiterGain = if (targetGain < limiterGain) {
-                    targetGain
-                } else {
-                    limiterGain + (targetGain - limiterGain) * limiterReleaseCoefficient
-                }
-
-                val delayedFrame = limiterBuffer[limiterWriteIndex]
-                repeat(channels) { channel ->
-                    val limited = (delayedFrame[channel] * limiterGain)
-                        .coerceIn(-limiterThreshold, limiterThreshold)
-                    if (encoding == C.ENCODING_PCM_FLOAT) {
-                        output.putFloat(limited)
-                    } else {
-                        output.putShort((limited * 32767f).toInt().coerceIn(-32768, 32767).toShort())
-                    }
-                }
+                limiterEnvelope + (framePeak - limiterEnvelope) * limiterRelease
             }
 
-            limiterFramesProcessed++
+            val targetLimiterGain = if (limiterEnvelope > limiterThreshold) {
+                limiterThreshold / limiterEnvelope
+            } else {
+                1f
+            }
+            limiterGain = if (targetLimiterGain < limiterGain) {
+                targetLimiterGain
+            } else {
+                limiterGain + (targetLimiterGain - limiterGain) * limiterRelease
+            }
+
+            repeat(channels) { channel ->
+                val limited = (frameSamples[channel] * limiterGain)
+                    .coerceIn(-limiterThreshold, limiterThreshold)
+                if (encoding == C.ENCODING_PCM_FLOAT) {
+                    output.putFloat(limited)
+                } else {
+                    val pcm = (limited * 32768f)
+                        .toInt().coerceIn(-32768, 32767)
+                    output.putShort(pcm.toShort())
+                }
+            }
         }
 
         input.position(input.position() + (availableBytes - byteCount))
         output.flip()
-    }
-
-    private fun prepareLimiter() {
-        // 3 ms of look-ahead is a practical compromise for mobile CPU and transient control.
-        limiterLookAheadFrames = (sampleRate * 3 / 1000).coerceAtLeast(1)
-        limiterBuffer = Array(limiterLookAheadFrames + 1) { FloatArray(channels) }
-        // A monotonic deque stores only candidate peaks: total work is O(1) amortized per frame.
-        val dequeCapacity = limiterLookAheadFrames + 2
-        peakDequeIndices = LongArray(dequeCapacity)
-        peakDequeValues = FloatArray(dequeCapacity)
-        limiterReleaseCoefficient = (1.0 - exp(-1.0 / (sampleRate * 0.075))).toFloat()
     }
 
     private fun rebuildEqualizer() {
@@ -236,7 +216,11 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         val nyquistLimit = (sampleRate * 0.45f).coerceAtLeast(20f)
         equalizerCoefficients = Array(bandFrequencies.size) { index ->
             val frequency = bandFrequencies[index].coerceIn(20f, nyquistLimit)
-            createPeakingBiquad(frequency, gains.getOrElse(index) { 0f }.coerceIn(-12f, 12f), 1.05f)
+            createPeakingBiquad(
+                frequency,
+                gains.getOrElse(index) { 0f }.coerceIn(-12f, 12f),
+                1.05f
+            )
         }
     }
 
@@ -275,13 +259,11 @@ class DeepBassAudioProcessor : BaseAudioProcessor() {
         presenceLowState = FloatArray(channels)
         eqZ1 = Array(bandFrequencies.size) { FloatArray(channels) }
         eqZ2 = Array(bandFrequencies.size) { FloatArray(channels) }
-        for (frame in limiterBuffer) frame.fill(0f)
-        limiterWriteIndex = 0
+        smoothedBass = bassAmount.coerceIn(0f, 1f)
+        smoothedPunch = punchAmount.coerceIn(0f, 1f)
+        smoothedVocal = vocalAmount.coerceIn(0f, 1f)
+        smoothedPreampGain = 10.0.pow(preampDb.coerceIn(-12f, 0f) / 20.0).toFloat()
+        limiterEnvelope = 0f
         limiterGain = 1f
-        limiterFramesProcessed = 0L
-        peakDequeHead = 0
-        peakDequeCount = 0
-        peakDequeIndices.fill(0L)
-        peakDequeValues.fill(0f)
     }
 }
