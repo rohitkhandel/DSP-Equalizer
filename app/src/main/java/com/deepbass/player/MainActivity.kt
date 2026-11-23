@@ -166,7 +166,7 @@ fun DeepBassScreen() {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Preamp / Headroom", color = Color.White)
                         Spacer(Modifier.weight(1f))
-                        Text("\${preamp.toInt()} dB", color = Color(0xFFB7F36B))
+                        Text("${preamp.toInt()} dB", color = Color(0xFFB7F36B))
                     }
                     Slider(value = preamp, onValueChange = { preamp = it }, valueRange = -12f..0f, steps = 23)
                     Text("Lower values make extra space for bass and EQ boosts", color = Color.Gray, fontSize = 10.sp)
@@ -219,7 +219,7 @@ private fun ControlSlider(
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(label, color = Color.White)
             Spacer(Modifier.weight(1f))
-            Text("\${value.toInt()}%", color = Color(0xFFB7F36B))
+            Text("${value.toInt()}%", color = Color(0xFFB7F36B))
         }
         Slider(value = value, onValueChange = onValueChange, valueRange = 0f..100f)
         Text(helper, color = Color.Gray, fontSize = 10.sp)
