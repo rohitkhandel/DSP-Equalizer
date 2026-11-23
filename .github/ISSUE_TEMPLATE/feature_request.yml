@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a feature or improvement for DeepBass
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Which version?
+      options:
+        - Android app
+        - Web Studio
+        - Both
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to add?
+      description: Explain the feature and how you would use it.
+    validations:
+      required: true
